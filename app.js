@@ -304,10 +304,14 @@ function normalizeLine(line) {
     .replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
     .replace(/[￥]/g, '¥')
     .replace(/[，]/g, ',')
+    .replace(/([0-9])[,.]{2,}(?=[0-9]{3})/g, '$1,')
     .replace(/[\u3000\t]/g, ' ')
+    // OCR は ¥ を「\」や「半」と読むことが多いので、数字の直前なら ¥ に戻す
+    .replace(/(^|[\s(（])[\\¥半羊辛]+\s*(?=[0-9])/g, '$1¥')
     // OCR は日本語の文字の間に空白を入れがちなので詰める
     .replace(new RegExp(`([${CJK}]) +(?=[${CJK}])`, 'g'), '$1')
     .replace(/ +/g, ' ')
+    .replace(/([(（]) | (?=[)）])/g, '$1')
     .trim();
 }
 
@@ -321,7 +325,14 @@ function cleanName(s) {
     .trim();
 }
 
+// 名前として使えそうか（記号や1文字だけのOCRのゴミではないか）
+function looksLikeName(s) {
+  return (s.match(new RegExp(`[A-Za-z${CJK}]`, 'g')) || []).length >= 2;
+}
+
 function findPrice(line) {
+  // 「1,650(税込)」の(税込)は OCR で崩れやすいので、金額の後ろの短いかっこ書きごと外す
+  line = line.replace(/([0-9])\s*[(（][^()（）]{0,4}[)）]?\s*$/, '$1');
   for (const re of PRICE_RES) {
     const hits = [...line.matchAll(re)];
     if (hits.length) {
@@ -346,10 +357,11 @@ function parseGoods(text) {
     if (!line) continue;
     const p = findPrice(line);
     if (!p) {
-      pendingName = cleanName(line);
+      const name = cleanName(line);
+      if (looksLikeName(name)) pendingName = name;
       continue;
     }
-    const name = p.name || pendingName;
+    const name = looksLikeName(p.name) ? p.name : pendingName;
     pendingName = '';
     if (!name || !p.price) continue;
     found.push({ name, price: p.price, checked: !NOT_GOODS_RE.test(name) });
@@ -462,6 +474,141 @@ function getOcrWorker() {
   return ocrWorkerPromise;
 }
 
+// 読み取りやすいように白黒にする。背景が暗い（ダークモード）なら反転して黒い文字にそろえる
+async function prepareImage(file) {
+  const bmp = await createImageBitmap(file);
+  // 小さい画像は文字が潰れるので拡大する
+  const scale = bmp.width < 1000 ? 2 : 1;
+  const w = bmp.width * scale;
+  const h = bmp.height * scale;
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(bmp, 0, 0, w, h);
+  bmp.close?.();
+
+  const img = ctx.getImageData(0, 0, w, h);
+  const px = img.data;
+  const gray = new Uint8ClampedArray(w * h);
+  let total = 0;
+  for (let i = 0; i < gray.length; i++) {
+    gray[i] = (px[i * 4] * 299 + px[i * 4 + 1] * 587 + px[i * 4 + 2] * 114) / 1000;
+    total += gray[i];
+  }
+  if (total / gray.length < 128) {
+    for (let i = 0; i < gray.length; i++) gray[i] = 255 - gray[i];
+  }
+
+  // 大津の方法で文字と背景を分けるしきい値を決める
+  const hist = new Array(256).fill(0);
+  for (const v of gray) hist[v]++;
+  let sumAll = 0;
+  for (let i = 0; i < 256; i++) sumAll += i * hist[i];
+  let sumBg = 0;
+  let countBg = 0;
+  let best = 0;
+  let threshold = 128;
+  for (let i = 0; i < 256; i++) {
+    countBg += hist[i];
+    if (!countBg) continue;
+    const countFg = gray.length - countBg;
+    if (!countFg) break;
+    sumBg += i * hist[i];
+    const diff = sumBg / countBg - (sumAll - sumBg) / countFg;
+    const between = countBg * countFg * diff * diff;
+    if (between > best) {
+      best = between;
+      threshold = i;
+    }
+  }
+  for (let i = 0; i < gray.length; i++) {
+    px[i * 4] = px[i * 4 + 1] = px[i * 4 + 2] = gray[i] > threshold ? 255 : 0;
+  }
+  ctx.putImageData(img, 0, 0);
+  return canvas;
+}
+
+// 1行の中で大きく離れた単語どうしは別の欄として分ける。
+// 「名前 ……… 価格」のように右側が金額だけなら同じ欄のままにする
+function splitLine(line) {
+  const height = line.bbox.y1 - line.bbox.y0;
+  const segments = [];
+  let prev = null;
+  for (const word of line.words) {
+    if (!prev || word.bbox.x0 - prev.bbox.x1 > height * 2.5) {
+      segments.push({ words: [], x0: word.bbox.x0, x1: word.bbox.x1, y: line.bbox.y0 });
+    }
+    const seg = segments[segments.length - 1];
+    seg.words.push(word.text);
+    seg.x1 = word.bbox.x1;
+    prev = word;
+  }
+  const merged = [];
+  for (const seg of segments) {
+    seg.text = normalizeLine(seg.words.join(' '));
+    const last = merged[merged.length - 1];
+    const p = findPrice(seg.text);
+    const priceOnly = p && !looksLikeName(p.name);
+    if (last && priceOnly && !findPrice(last.text)) {
+      last.text += ' ' + seg.text;
+      last.x1 = seg.x1;
+    } else {
+      merged.push(seg);
+    }
+  }
+  return merged;
+}
+
+// グリッド表示の通販サイトなど、横に並んだ欄は左の列から順に読むよう並べ替える
+function orderSegments(rows, width) {
+  const columns = Math.max(1, ...rows.map((r) => r.length));
+  if (columns === 1) return rows.map((r) => r[0].text);
+  const segs = rows.flat().map((seg) => ({
+    ...seg,
+    col: Math.min(columns - 1, Math.floor(((seg.x0 + seg.x1) / 2) / (width / columns))),
+  }));
+  segs.sort((a, b) => a.col - b.col || a.y - b.y);
+  return segs.map((seg) => seg.text);
+}
+
+async function ocrCanvas(worker, image) {
+  const { data } = await worker.recognize(image, {}, { blocks: true, text: true });
+  const rows = [];
+  let confSum = 0;
+  let charCount = 0;
+  let width = 1;
+  for (const block of data.blocks || []) {
+    for (const para of block.paragraphs) {
+      for (const line of para.lines) {
+        const len = line.text.trim().length;
+        confSum += line.confidence * len;
+        charCount += len;
+        width = Math.max(width, line.bbox.x1);
+        // 写真の部分などから出た自信の低い文字列は捨てる（金額を含む行は残す）
+        if (line.confidence < 40 && !/[0-9]/.test(line.text)) continue;
+        const segs = splitLine(line).filter((seg) => seg.text);
+        if (segs.length) rows.push(segs);
+      }
+    }
+  }
+  const text = orderSegments(rows, width).join('\n');
+  return { text, count: parseGoods(text).length, confidence: charCount ? confSum / charCount : 0 };
+}
+
+// 元の画像と白黒にした画像の両方を読み、グッズが多く取れて自信の高い方を使う。
+// 白黒は色付き背景に強く、元の画像は写真が混ざった画面に強い
+async function ocrImage(file) {
+  const worker = await getOcrWorker();
+  const results = [];
+  for (const image of [file, await prepareImage(file)]) {
+    results.push(await ocrCanvas(worker, image));
+  }
+  results.sort((a, b) => b.count - a.count || b.confidence - a.confidence);
+  return results[0].text;
+}
+
 document.getElementById('bulk-image').onchange = async (e) => {
   const file = e.target.files[0];
   e.target.value = '';
@@ -469,10 +616,9 @@ document.getElementById('bulk-image').onchange = async (e) => {
   setBulkStatus('準備中…（初回は少し時間がかかります）');
   bulkAdd.disabled = true;
   try {
-    const worker = await getOcrWorker();
+    await getOcrWorker();
     setBulkStatus('読み取り中…');
-    const { data } = await worker.recognize(file);
-    const text = data.text.split('\n').map(normalizeLine).filter(Boolean).join('\n');
+    const text = await ocrImage(file);
     bulkText.value = bulkText.value.trim() ? bulkText.value.trim() + '\n' + text : text;
     renderBulkPreview();
     setBulkStatus(bulkFound.length
