@@ -1,6 +1,6 @@
 // オフラインでも開けるようにファイルをキャッシュする。
 // 通信できるときは常に最新を取りに行き、だめならキャッシュを使う。
-const CACHE = 'calc-buy-goods-v5';
+const CACHE = 'calc-buy-goods-v6';
 const FILES = [
   './', 'index.html', 'style.css', 'app.js', 'manifest.webmanifest',
   'icons/icon.svg', 'icons/icon-180.png', 'icons/icon-192.png', 'icons/icon-512.png',
