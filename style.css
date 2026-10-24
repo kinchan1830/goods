@@ -69,7 +69,18 @@ input {
   background: var(--card);
   color: var(--text);
 }
-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+textarea {
+  font: inherit;
+  font-size: 16px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+  color: var(--text);
+  resize: vertical;
+}
+input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 
 .topbar {
   display: flex;
@@ -141,6 +152,8 @@ input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .qty button { width: 34px; height: 34px; padding: 0; }
 .qty span { min-width: 24px; text-align: center; font-variant-numeric: tabular-nums; }
 .item .subtotal { margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
+
+.bulk-open { width: 100%; margin-top: 10px; }
 
 .add-form { display: grid; grid-template-columns: 1fr 110px auto; gap: 8px; margin-top: 10px; }
 
@@ -236,3 +249,11 @@ dialog form { display: grid; gap: 12px; }
   border-radius: 10px;
   cursor: pointer;
 }
+
+/* まとめて入力 */
+#bulk-dialog { max-height: 90vh; }
+.bulk-list { display: grid; gap: 6px; }
+.bulk-row { display: grid; grid-template-columns: auto 1fr 90px; gap: 6px; align-items: center; }
+.bulk-row .check { width: 22px; height: 22px; accent-color: var(--accent); }
+.bulk-row.off { opacity: .5; }
+.bulk-empty { color: var(--muted); font-size: 13px; margin: 0; }
