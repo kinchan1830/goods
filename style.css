@@ -60,6 +60,8 @@ button.link { border: none; background: none; padding: 6px 4px; color: var(--acc
 
 input {
   font: inherit;
+  /* iPhone は 16px 未満の入力欄を触ると自動でズームするので、ラベルの文字サイズを継がずに固定する */
+  font-size: 16px;
   width: 100%;
   padding: 10px 12px;
   border: 1px solid var(--line);
