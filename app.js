@@ -307,6 +307,7 @@ function normalizeLine(line) {
     .replace(/([0-9])[,.]{2,}(?=[0-9]{3})/g, '$1,')
     .replace(/[\u3000\t]/g, ' ')
     // OCR は ¥ を「\」や「半」と読むことが多いので、数字の直前なら ¥ に戻す
+    .replace(/[\\¥]\s*ギ/g, '¥')
     .replace(/(^|[\s(（])[\\¥半羊辛]+\s*(?=[0-9])/g, '$1¥')
     // OCR は日本語の文字の間に空白を入れがちなので詰める
     .replace(new RegExp(`([${CJK}]) +(?=[${CJK}])`, 'g'), '$1')
@@ -446,6 +447,7 @@ document.getElementById('bulk-form').onsubmit = (e) => {
 // 初回だけライブラリと日本語データ（数MB）をダウンロードする。
 const TESSERACT_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
 let ocrWorkerPromise = null;
+const OCR_PSM = '3';
 
 function loadScript(src) {
   return new Promise((resolve, reject) => {
@@ -461,23 +463,27 @@ function getOcrWorker() {
   if (!ocrWorkerPromise) {
     ocrWorkerPromise = (async () => {
       if (!window.Tesseract) await loadScript(TESSERACT_URL);
-      return Tesseract.createWorker('jpn', 1, {
+      const worker = await Tesseract.createWorker('jpn', 1, {
         logger: (m) => {
           if (m.status === 'recognizing text') {
             setBulkStatus(`読み取り中… ${Math.round(m.progress * 100)}%`);
           }
         },
       });
+      // 標準の「1つの文章のかたまり」扱いだと、写真や横並びの商品が混ざって崩れるので、
+      // 段組みを自動で見分けるモードにする。名前と金額の組み合わせは pairByPosition で位置から決める
+      await worker.setParameters({ tessedit_pageseg_mode: OCR_PSM });
+      return worker;
     })();
     ocrWorkerPromise.catch(() => { ocrWorkerPromise = null; });
   }
   return ocrWorkerPromise;
 }
 
-// 読み取りやすいように白黒にする。背景が暗い（ダークモード）なら反転して黒い文字にそろえる
-async function prepareImage(file) {
+// 読み取り用の画像を作る。小さい画像は文字が潰れるので拡大する。
+// binarize なら白黒にし、背景が暗い（ダークモード）ときは反転して黒い文字にそろえる
+async function prepareImage(file, binarize) {
   const bmp = await createImageBitmap(file);
-  // 小さい画像は文字が潰れるので拡大する
   const scale = bmp.width < 1000 ? 2 : 1;
   const w = bmp.width * scale;
   const h = bmp.height * scale;
@@ -488,6 +494,7 @@ async function prepareImage(file) {
   ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(bmp, 0, 0, w, h);
   bmp.close?.();
+  if (!binarize) return canvas;
 
   const img = ctx.getImageData(0, 0, w, h);
   const px = img.data;
@@ -538,16 +545,19 @@ function splitLine(line) {
   let prev = null;
   for (const word of line.words) {
     if (!prev || word.bbox.x0 - prev.bbox.x1 > height * 2.5) {
-      segments.push({ words: [], x0: word.bbox.x0, x1: word.bbox.x1, y: line.bbox.y0 });
+      segments.push({
+        words: [], x0: word.bbox.x0, x1: word.bbox.x1, y0: line.bbox.y0, y1: line.bbox.y1, conf: line.confidence,
+      });
     }
     const seg = segments[segments.length - 1];
     seg.words.push(word.text);
     seg.x1 = word.bbox.x1;
+    // 金額の読み間違いは数字の単語の自信度に出やすいので、それを金額の自信度にする
+    if (/[0-9]/.test(word.text)) seg.priceConf = Math.min(seg.priceConf ?? 100, word.confidence);
     prev = word;
   }
   const merged = [];
-  for (const seg of segments) {
-    seg.text = normalizeLine(seg.words.join(' '));
+  for (const seg of segments.flatMap(splitPrices)) {
     const last = merged[merged.length - 1];
     const p = findPrice(seg.text);
     const priceOnly = p && !looksLikeName(p.name);
@@ -558,55 +568,107 @@ function splitLine(line) {
       merged.push(seg);
     }
   }
-  return merged;
+  return merged.filter((seg) => seg.text);
 }
 
-// グリッド表示の通販サイトなど、横に並んだ欄は左の列から順に読むよう並べ替える
-function orderSegments(rows, width) {
-  const columns = Math.max(1, ...rows.map((r) => r.length));
-  if (columns === 1) return rows.map((r) => r[0].text);
-  const segs = rows.flat().map((seg) => ({
+// 「¥3,300 ¥1,200」のように2つの金額がくっついて読まれたら分ける。
+// 横位置は文字数の割合でざっくり割り振る
+function splitPrices(seg) {
+  const text = normalizeLine(seg.words.join(' '));
+  const starts = [...text.matchAll(/¥\s*[0-9]/g)].map((m) => m.index).filter((i) => i > 0);
+  if (!starts.length) return [{ ...seg, text }];
+  const bounds = [0, ...starts, text.length];
+  const perChar = (seg.x1 - seg.x0) / text.length;
+  return bounds.slice(0, -1).map((start, i) => ({
     ...seg,
-    col: Math.min(columns - 1, Math.floor(((seg.x0 + seg.x1) / 2) / (width / columns))),
+    text: text.slice(start, bounds[i + 1]).trim(),
+    x0: seg.x0 + start * perChar,
+    x1: seg.x0 + bounds[i + 1] * perChar,
   }));
-  segs.sort((a, b) => a.col - b.col || a.y - b.y);
-  return segs.map((seg) => seg.text);
+}
+
+// 「1会計1点まで」のような注意書きやスマホ上端の時刻は商品名にしない
+const NOT_NAME_RE = /会計|点まで|お一人様|限り|売り?切れ|SOLD|在庫|^[0-9]{1,2}:[0-9]{2}/i;
+
+// 画面上の位置から、金額ごとに商品名を決める。
+// 金額と同じ欄に名前があればそれを、なければ同じ高さの左側、それもなければ
+// すぐ上で横位置が重なる行を使う。通販サイトのように商品が横に並んでいても列が混ざらない
+function pairByPosition(segs) {
+  segs.sort((a, b) => a.y0 - b.y0 || a.x0 - b.x0);
+  const isName = (seg) => !findPrice(seg.text) && looksLikeName(seg.text) && !NOT_NAME_RE.test(seg.text);
+  const out = [];
+  const used = new Set();
+  for (const seg of segs) {
+    const p = findPrice(seg.text);
+    if (!p || !p.price) continue;
+    const item = {
+      price: p.price, priceConf: seg.priceConf ?? seg.conf, x: seg.x0, y: seg.y0, height: seg.y1 - seg.y0,
+    };
+    if (looksLikeName(p.name) && !NOT_NAME_RE.test(p.name)) {
+      out.push({ ...item, name: p.name, nameConf: seg.conf });
+      continue;
+    }
+    const height = seg.y1 - seg.y0;
+    let best = null;
+    let bestScore = Infinity;
+    for (const cand of segs) {
+      if (used.has(cand) || !isName(cand)) continue;
+      const sameRow = Math.min(seg.y1, cand.y1) - Math.max(seg.y0, cand.y0) > height / 2;
+      let score;
+      if (sameRow && cand.x1 <= seg.x0) {
+        score = 0;
+      } else {
+        const gap = seg.y0 - cand.y1;
+        const overlap = Math.min(seg.x1, cand.x1) - Math.max(seg.x0, cand.x0);
+        if (gap < -height / 2 || gap > height * 4 || overlap <= 0) continue;
+        score = 1 + gap;
+      }
+      if (score < bestScore) {
+        best = cand;
+        bestScore = score;
+      }
+    }
+    if (best) {
+      used.add(best);
+      out.push({ ...item, name: cleanName(best.text), nameConf: best.conf });
+    }
+  }
+  return out;
 }
 
 async function ocrCanvas(worker, image) {
   const { data } = await worker.recognize(image, {}, { blocks: true, text: true });
-  const rows = [];
-  let confSum = 0;
-  let charCount = 0;
-  let width = 1;
+  const segs = [];
   for (const block of data.blocks || []) {
     for (const para of block.paragraphs) {
       for (const line of para.lines) {
-        const len = line.text.trim().length;
-        confSum += line.confidence * len;
-        charCount += len;
-        width = Math.max(width, line.bbox.x1);
         // 写真の部分などから出た自信の低い文字列は捨てる（金額を含む行は残す）
-        if (line.confidence < 40 && !/[0-9]/.test(line.text)) continue;
-        const segs = splitLine(line).filter((seg) => seg.text);
-        if (segs.length) rows.push(segs);
+        if (line.confidence < 60 && !/[0-9]/.test(line.text)) continue;
+        segs.push(...splitLine(line));
       }
     }
   }
-  const text = orderSegments(rows, width).join('\n');
-  return { text, count: parseGoods(text).length, confidence: charCount ? confSum / charCount : 0 };
+  return pairByPosition(segs);
 }
 
-// 元の画像と白黒にした画像の両方を読み、グッズが多く取れて自信の高い方を使う。
-// 白黒は色付き背景に強く、元の画像は写真が混ざった画面に強い
+// 元の画像と白黒にした画像の両方を読み、同じ位置の商品は名前・金額それぞれ
+// 自信の高い方を使う。白黒は色付き背景に強く、元の画像は写真が混ざった画面に強い
 async function ocrImage(file) {
   const worker = await getOcrWorker();
-  const results = [];
-  for (const image of [file, await prepareImage(file)]) {
-    results.push(await ocrCanvas(worker, image));
+  const items = [];
+  for (const binarize of [false, true]) {
+    for (const it of await ocrCanvas(worker, await prepareImage(file, binarize))) {
+      const same = items.find((x) => Math.abs(x.y - it.y) < it.height && Math.abs(x.x - it.x) < it.height * 3);
+      if (!same) {
+        items.push(it);
+        continue;
+      }
+      if (it.nameConf > same.nameConf) Object.assign(same, { name: it.name, nameConf: it.nameConf });
+      if (it.priceConf > same.priceConf) Object.assign(same, { price: it.price, priceConf: it.priceConf });
+    }
   }
-  results.sort((a, b) => b.count - a.count || b.confidence - a.confidence);
-  return results[0].text;
+  items.sort((a, b) => a.y - b.y || a.x - b.x);
+  return items.map((it) => `${it.name} ${it.price}円`).join('\n');
 }
 
 document.getElementById('bulk-image').onchange = async (e) => {
