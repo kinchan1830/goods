@@ -45,6 +45,28 @@
     </form>
   </dialog>
 
+  <dialog id="bulk-dialog">
+    <form id="bulk-form" method="dialog">
+      <h2>まとめて入力</h2>
+      <p class="note">
+        グッズ一覧のテキストを貼り付けるか、スクショを選ぶと、グッズ名と単価を読み取ります。
+        読み取りはこのスマホの中で行い、画像はどこにも送りません。
+      </p>
+      <label class="file-button">
+        📷 画像から読み取る
+        <input type="file" id="bulk-image" accept="image/*" hidden>
+      </label>
+      <p class="note" id="bulk-status" hidden></p>
+      <textarea id="bulk-text" rows="6" placeholder="例：&#10;アクリルスタンド 1,500円&#10;缶バッジ（ランダム） ¥500&#10;Tシャツ&#10;4,000円"></textarea>
+      <div id="bulk-preview"></div>
+      <div class="dialog-actions">
+        <span class="spacer"></span>
+        <button type="button" id="bulk-cancel">キャンセル</button>
+        <button type="submit" class="primary" id="bulk-add" disabled>追加</button>
+      </div>
+    </form>
+  </dialog>
+
   <script src="app.js"></script>
 </body>
 </html>

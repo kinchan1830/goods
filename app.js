@@ -156,6 +156,7 @@ function renderEvent(ev) {
       <input name="price" placeholder="単価" inputmode="numeric" required>
       <button class="primary" type="submit">追加</button>
     </form>
+    <button class="bulk-open" id="bulk-open">📋 まとめて入力（テキスト・画像）</button>
 
     <h3 class="section-title">送料・手数料</h3>
     <div class="costs card">
@@ -179,6 +180,7 @@ function renderEvent(ev) {
   updateSummary(ev);
 
   document.getElementById('edit-event').onclick = () => openEventDialog(ev);
+  document.getElementById('bulk-open').onclick = () => openBulkDialog(ev);
 
   document.getElementById('add-form').onsubmit = (e) => {
     e.preventDefault();
@@ -282,6 +284,205 @@ function updateSummary(ev) {
     <div class="breakdown">グッズ ${yen(goods)} ＋ 送料 ${yen(ev.shipping)} ＋ 手数料 ${yen(ev.fee)}</div>
   `;
 }
+
+// ---- まとめて入力（テキスト・画像から） ----
+
+// 価格の数字。OCR がカンマをピリオドに読むことがあるので両方受け付ける
+const NUM = '([0-9]{1,3}(?:[,.][0-9]{3})+|[0-9]+)';
+const PRICE_RES = [
+  new RegExp('[¥\\\\]\\s*' + NUM, 'g'),
+  new RegExp(NUM + '\\s*円', 'g'),
+];
+// 円も¥もない行は、行末の数字（2桁以上）を単価とみなす
+const BARE_PRICE_RE = new RegExp('(?:^|[\\s:：\\t])' + NUM + '\\s*$');
+// 合計などはグッズではないので、読み取ってもチェックを外しておく
+const NOT_GOODS_RE = /合計|小計|総額|送料|手数料|ポイント|割引|クーポン|お支払/;
+const CJK = '\u3000-\u30ff\u3400-\u9fff\uff01-\uff60';
+
+function normalizeLine(line) {
+  return line
+    .replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+    .replace(/[￥]/g, '¥')
+    .replace(/[，]/g, ',')
+    .replace(/[\u3000\t]/g, ' ')
+    // OCR は日本語の文字の間に空白を入れがちなので詰める
+    .replace(new RegExp(`([${CJK}]) +(?=[${CJK}])`, 'g'), '$1')
+    .replace(/ +/g, ' ')
+    .trim();
+}
+
+function cleanName(s) {
+  return s
+    .replace(/[(（][^()（）]*税[^()（）]*[)）]/g, '')
+    .replace(/税込み?|税抜き?|価格|単価|定価/g, '')
+    .replace(/[(（]\s*[)）]/g, '')
+    .replace(/^[\s・:：\-/／|｜→⇒_＿]+|[\s・:：\-/／|｜→⇒_＿]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function findPrice(line) {
+  for (const re of PRICE_RES) {
+    const hits = [...line.matchAll(re)];
+    if (hits.length) {
+      // 「定価1,800円 → 1,500円」のように複数あるときは最後を使う
+      const last = hits[hits.length - 1];
+      return { price: toInt(last[1]), name: cleanName(line.replace(re, ' ')) };
+    }
+  }
+  const m = line.match(BARE_PRICE_RE);
+  if (m && m[1].replace(/[,.]/g, '').length >= 2) {
+    return { price: toInt(m[1]), name: cleanName(line.slice(0, m.index)) };
+  }
+  return null;
+}
+
+// 1行に「名前 価格」、または名前の行のすぐ後に価格だけの行、の両方に対応する
+function parseGoods(text) {
+  const found = [];
+  let pendingName = '';
+  for (const raw of text.split(/\r?\n/)) {
+    const line = normalizeLine(raw);
+    if (!line) continue;
+    const p = findPrice(line);
+    if (!p) {
+      pendingName = cleanName(line);
+      continue;
+    }
+    const name = p.name || pendingName;
+    pendingName = '';
+    if (!name || !p.price) continue;
+    found.push({ name, price: p.price, checked: !NOT_GOODS_RE.test(name) });
+  }
+  return found;
+}
+
+const bulkDialog = document.getElementById('bulk-dialog');
+const bulkText = document.getElementById('bulk-text');
+const bulkPreview = document.getElementById('bulk-preview');
+const bulkAdd = document.getElementById('bulk-add');
+const bulkStatus = document.getElementById('bulk-status');
+let bulkEvent = null;
+let bulkFound = [];
+
+function setBulkStatus(msg) {
+  bulkStatus.hidden = !msg;
+  bulkStatus.textContent = msg || '';
+}
+
+function renderBulkPreview() {
+  bulkFound = parseGoods(bulkText.value);
+  if (!bulkText.value.trim()) {
+    bulkPreview.innerHTML = '';
+  } else if (!bulkFound.length) {
+    bulkPreview.innerHTML = '<p class="bulk-empty">グッズ名と金額が見つかりませんでした。</p>';
+  } else {
+    bulkPreview.innerHTML = '<div class="bulk-list"></div>';
+    const list = bulkPreview.firstChild;
+    bulkFound.forEach((it) => {
+      const row = document.createElement('div');
+      row.className = 'bulk-row' + (it.checked ? '' : ' off');
+      row.innerHTML = `
+        <input type="checkbox" class="check" ${it.checked ? 'checked' : ''} aria-label="追加する">
+        <input class="name" value="${esc(it.name)}" aria-label="グッズ名">
+        <input class="price" inputmode="numeric" value="${it.price}" aria-label="単価">
+      `;
+      row.querySelector('.check').onchange = (e) => {
+        it.checked = e.target.checked;
+        row.classList.toggle('off', !it.checked);
+        updateBulkButton();
+      };
+      row.querySelector('.name').oninput = (e) => { it.name = e.target.value; };
+      row.querySelector('.price').oninput = (e) => { it.price = toInt(e.target.value); };
+      list.appendChild(row);
+    });
+  }
+  updateBulkButton();
+}
+
+function updateBulkButton() {
+  const n = bulkFound.filter((it) => it.checked).length;
+  bulkAdd.disabled = n === 0;
+  bulkAdd.textContent = n ? `${n}件追加` : '追加';
+}
+
+function openBulkDialog(ev) {
+  bulkEvent = ev;
+  bulkText.value = '';
+  setBulkStatus('');
+  renderBulkPreview();
+  bulkDialog.showModal();
+}
+
+bulkText.oninput = renderBulkPreview;
+document.getElementById('bulk-cancel').onclick = () => bulkDialog.close();
+
+document.getElementById('bulk-form').onsubmit = (e) => {
+  e.preventDefault();
+  const ev = bulkEvent;
+  const picked = bulkFound.filter((it) => it.checked && it.name.trim());
+  if (!ev || !picked.length) return;
+  for (const it of picked) {
+    ev.items.push({ id: newId(), name: it.name.trim(), price: it.price, qty: 1, checked: true });
+  }
+  touch(ev);
+  bulkDialog.close();
+  renderEvent(ev);
+};
+
+// 画像の文字読み取りは Tesseract.js（無料のOCR）をブラウザ内で動かす。
+// 初回だけライブラリと日本語データ（数MB）をダウンロードする。
+const TESSERACT_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
+let ocrWorkerPromise = null;
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src;
+    s.onload = resolve;
+    s.onerror = () => reject(new Error('読み込みに失敗しました'));
+    document.head.appendChild(s);
+  });
+}
+
+function getOcrWorker() {
+  if (!ocrWorkerPromise) {
+    ocrWorkerPromise = (async () => {
+      if (!window.Tesseract) await loadScript(TESSERACT_URL);
+      return Tesseract.createWorker('jpn', 1, {
+        logger: (m) => {
+          if (m.status === 'recognizing text') {
+            setBulkStatus(`読み取り中… ${Math.round(m.progress * 100)}%`);
+          }
+        },
+      });
+    })();
+    ocrWorkerPromise.catch(() => { ocrWorkerPromise = null; });
+  }
+  return ocrWorkerPromise;
+}
+
+document.getElementById('bulk-image').onchange = async (e) => {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (!file) return;
+  setBulkStatus('準備中…（初回は少し時間がかかります）');
+  bulkAdd.disabled = true;
+  try {
+    const worker = await getOcrWorker();
+    setBulkStatus('読み取り中…');
+    const { data } = await worker.recognize(file);
+    const text = data.text.split('\n').map(normalizeLine).filter(Boolean).join('\n');
+    bulkText.value = bulkText.value.trim() ? bulkText.value.trim() + '\n' + text : text;
+    renderBulkPreview();
+    setBulkStatus(bulkFound.length
+      ? '読み取りました。名前や金額がずれていたら直してから追加してください。'
+      : '金額を読み取れませんでした。下の文字を直すと候補が出ます。');
+  } catch (err) {
+    setBulkStatus('読み取れませんでした（通信できる場所でもう一度試してください）');
+    updateBulkButton();
+  }
+};
 
 // ---- イベントの作成・編集 ----
 
